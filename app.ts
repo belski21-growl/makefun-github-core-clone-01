@@ -14,6 +14,9 @@
 
 import {
   createServer,
+  type Socket,
+} from 'node:net';
+import {
   type IncomingMessage,
   type Server,
   type ServerResponse,
@@ -42,7 +45,7 @@ import {
   type Repo,
 } from './store.ts';
 import { executeGraphQL, executeGraphQLBatch } from './graphql.ts';
-import { handleMcp, issueJson, repoJson } from './mcp.ts';
+import { handleMcp, issueJson, issueJsonText, repoJson } from './mcp.ts';
 
 // The bearer the suite presents lives in the process environment. An empty
 // environment token means "accept any non-empty bearer", which is how the local
@@ -57,16 +60,23 @@ const JSON_MEDIA = 'application/json; charset=utf-8';
 // reply sequence, so replaying the same requests yields the same headers.
 const QUOTA_TOTAL = 5000;
 const QUOTA_RESET_AT = 1700000000 + 3600;
+const QUOTA_TOTAL_S = String(QUOTA_TOTAL);
+const QUOTA_RESET_S = String(QUOTA_RESET_AT);
 let quotaSpent = 0;
 
-function quotaHeaders(): Record<string, string> {
+/**
+ * Stamp the per-reply identity/quota headers onto a headers object the caller
+ * already built. One increment per reply, so the rate_limit body (which reads
+ * quotaSpent + 1 for its own reply) keeps agreeing with the header. Inlined
+ * into the caller's literal instead of a fresh object + spread per reply.
+ */
+function stampHeaders(headers: Record<string, string>): void {
   quotaSpent += 1;
-  return {
-    'x-ratelimit-limit': String(QUOTA_TOTAL),
-    'x-ratelimit-remaining': String(Math.max(0, QUOTA_TOTAL - quotaSpent)),
-    'x-ratelimit-reset': String(QUOTA_RESET_AT),
-    'x-ratelimit-used': String(quotaSpent),
-  };
+  headers['x-github-request-id'] = vault.nextRequestId();
+  headers['x-ratelimit-limit'] = QUOTA_TOTAL_S;
+  headers['x-ratelimit-remaining'] = String(Math.max(0, QUOTA_TOTAL - quotaSpent));
+  headers['x-ratelimit-reset'] = QUOTA_RESET_S;
+  headers['x-ratelimit-used'] = String(quotaSpent);
 }
 
 // The vault every surface shares: repositories, git objects, issues, pulls.
@@ -91,10 +101,9 @@ function replyJson(
   const text = status === 204 ? '' : `${JSON.stringify(payload)}\n`;
   const headers: Record<string, string> = {
     'content-type': JSON_MEDIA,
-    'x-github-request-id': vault.nextRequestId(),
-    ...quotaHeaders(),
     ...extra,
   };
+  stampHeaders(headers);
   if (status !== 204) headers['content-length'] = String(Buffer.byteLength(text));
   res.writeHead(status, headers);
   res.end(text);
@@ -104,42 +113,60 @@ function replyFailure(res: ServerResponse, status: number, message: string): voi
   replyJson(res, status, { message });
 }
 
+/**
+ * Answer with a JSON body that is already serialised (a cached issue view, a
+ * joined list). Byte-identical to replyJson of the same value: the same
+ * headers, the same trailing newline, only the stringify step skipped.
+ */
+function replyJsonText(
+  res: ServerResponse,
+  status: number,
+  text: string,
+  extra: Record<string, string> = {},
+): void {
+  const body = status === 204 ? '' : `${text}\n`;
+  const headers: Record<string, string> = {
+    'content-type': JSON_MEDIA,
+    ...extra,
+  };
+  stampHeaders(headers);
+  if (status !== 204) headers['content-length'] = String(Buffer.byteLength(body));
+  res.writeHead(status, headers);
+  res.end(body);
+}
+
 /** Answer with raw bytes (git protocol payloads): no JSON envelope, same id/quota headers. */
 function replyBytes(res: ServerResponse, status: number, payload: Buffer, media: string): void {
-  res.writeHead(status, {
+  const headers: Record<string, string> = {
     'content-type': media,
     'content-length': payload.length,
-    'x-github-request-id': vault.nextRequestId(),
-    ...quotaHeaders(),
-  });
+  };
+  stampHeaders(headers);
+  res.writeHead(status, headers);
   res.end(payload);
-}
-
-/** The request path, without its query string. */
-function requestPath(url: URL): string {
-  return url.pathname;
-}
-
-function requestQuery(url: URL): URLSearchParams {
-  return url.searchParams;
 }
 
 /** Split a path into decoded, non-empty segments. A bad escape keeps its raw text. */
 function splitPath(path: string): string[] {
-  return path
-    .split('/')
-    .filter((piece) => piece !== '')
-    .map((piece) => {
-      try {
-        return decodeURIComponent(piece);
-      } catch {
-        return piece;
-      }
-    });
+  const raw = path.split('/').filter((piece) => piece !== '');
+  // Nearly every request path carries no escapes at all: skip the per-segment
+  // decodeURIComponent (a try/catch each) when there is nothing to decode.
+  if (!path.includes('%')) return raw;
+  return raw.map((piece) => {
+    try {
+      return decodeURIComponent(piece);
+    } catch {
+      return piece;
+    }
+  });
 }
 
 /** Drain the request body, guarding against an unbounded upload. */
 function collectBody(req: IncomingMessage): Promise<Buffer> {
+  // The raw transport reads the whole body before dispatch, so there is
+  // nothing to drain: hand it straight back.
+  const pre = (req as unknown as { bodyBuffer?: Buffer }).bodyBuffer;
+  if (pre !== undefined) return Promise.resolve(pre);
   return new Promise((resolve, reject) => {
     const pieces: Buffer[] = [];
     let seen = 0;
@@ -152,7 +179,7 @@ function collectBody(req: IncomingMessage): Promise<Buffer> {
         reject(new Error('request body too large'));
       }
     });
-    req.on('end', () => resolve(Buffer.concat(pieces)));
+    req.on('end', () => resolve(pieces.length === 1 ? pieces[0]! : Buffer.concat(pieces)));
     req.on('error', reject);
   });
 }
@@ -232,11 +259,14 @@ function viewerJson(): Record<string, unknown> {
   };
 }
 
-async function routeRest(req: IncomingMessage, res: ServerResponse, url: URL): Promise<void> {
+async function routeRest(
+  req: IncomingMessage,
+  res: ServerResponse,
+  parts: readonly string[],
+  query: URLSearchParams,
+): Promise<void> {
   const method = req.method ?? 'GET';
-  const path = requestPath(url);
-  const query = requestQuery(url);
-  const parts = splitPath(path.replace(/^\/api\/v3/, '') || '/');
+  parts = parts.slice(2);
 
   // The API root.
   if (parts.length === 0) {
@@ -426,6 +456,7 @@ async function routeRest(req: IncomingMessage, res: ServerResponse, url: URL): P
           return replyFailure(res, 422, `Validation Failed: object ${sha} does not exist`);
         }
         repo.refs.set(ref, sha);
+        repo.refsGen += 1;
         return replyJson(res, 201, { ref, object: { sha, type: 'commit' } });
       }
       if (method === 'GET' && tail.length >= 3) {
@@ -574,7 +605,8 @@ async function routeRest(req: IncomingMessage, res: ServerResponse, url: URL): P
             issues.length,
           );
           if (link !== null) extra.link = link;
-          return replyJson(res, 200, page.map((issue) => issueJson(vault, repo, issue)), extra);
+          const listText = `[${page.map((issue) => issueJsonText(vault, repo, issue)).join(',')}]`;
+          return replyJsonText(res, 200, listText, extra);
         }
         if (method === 'POST') {
           const raw = await collectBody(req);
@@ -607,7 +639,7 @@ async function routeRest(req: IncomingMessage, res: ServerResponse, url: URL): P
             typeof body.body === 'string' ? body.body : '',
             labels,
           );
-          return replyJson(res, 201, issueJson(vault, repo, issue));
+          return replyJsonText(res, 201, issueJsonText(vault, repo, issue));
         }
         return replyFailure(res, 404, 'Not Found');
       }
@@ -616,7 +648,7 @@ async function routeRest(req: IncomingMessage, res: ServerResponse, url: URL): P
       const issue = repo.issues.get(number);
       if (tail.length === 2) {
         if (issue === undefined) return replyFailure(res, 404, 'Not Found');
-        if (method === 'GET') return replyJson(res, 200, issueJson(vault, repo, issue));
+        if (method === 'GET') return replyJsonText(res, 200, issueJsonText(vault, repo, issue));
         if (method === 'PATCH') {
           const raw = await collectBody(req);
           const parsed = decodeJson(raw);
@@ -629,7 +661,8 @@ async function routeRest(req: IncomingMessage, res: ServerResponse, url: URL): P
             issue.closedAt = body.state === 'closed' ? FIXED_ISO : null;
           }
           issue.updatedAt = FIXED_ISO;
-          return replyJson(res, 200, issueJson(vault, repo, issue));
+          issue.jsonRev += 1;
+          return replyJsonText(res, 200, issueJsonText(vault, repo, issue));
         }
         return replyFailure(res, 404, 'Not Found');
       }
@@ -656,6 +689,7 @@ async function routeRest(req: IncomingMessage, res: ServerResponse, url: URL): P
           const commentBody = typeof body.body === 'string' ? body.body : '';
           const comment = { id: repo.nextCommentId++, body: commentBody, createdAt: FIXED_ISO };
           issue.comments.push(comment);
+          issue.jsonRev += 1;
           return replyJson(res, 201, {
             id: comment.id,
             body: comment.body,
@@ -789,6 +823,62 @@ function pullJson(vault: Store, repo: Repo, pull: Pull): Record<string, unknown>
   };
 }
 
+// --------------------------------------------------------------------------- git
+
+/**
+ * Cached fetch replies: the bytes an upload-pack fetch returns are a pure
+ * function of the repository's objects plus the fetch arguments (wants, haves,
+ * shallow boundaries, depth, protocol version). selectFetch sorts its output,
+ * so identical inputs give byte-identical packs. The key carries repo.packGen,
+ * which the store bumps on every object added, so a push can never leave a
+ * stale pack behind; ref moves alone cannot change a pack's bytes. The clone
+ * workload fires 50 identical shallow clones at once, so 49 of them skip
+ * selection, deflate and framing entirely. Bounded: the map is cleared past
+ * 256 entries rather than grown without limit.
+ */
+const packCache = new Map<string, Buffer>();
+
+function packCacheKey(
+  version: string,
+  repo: Repo,
+  wants: readonly string[],
+  haves: readonly string[],
+  shallow: readonly string[],
+  depth: number | undefined,
+): string {
+  return [
+    version,
+    repo.id,
+    repo.packGen,
+    wants.join(','),
+    haves.join(','),
+    shallow.join(','),
+    depth === undefined ? '' : String(depth),
+  ].join('|');
+}
+
+function packCacheGet(key: string): Buffer | undefined {
+  return packCache.get(key);
+}
+
+function packCachePut(key: string, body: Buffer): void {
+  if (packCache.size >= 256) packCache.clear();
+  packCache.set(key, body);
+}
+
+/**
+ * Cached advertisements (v0 advert + v2 ls-refs answer): both are pure
+ * functions of the repository's refs plus their arguments, and a clone
+ * repeats the same advertisement and ls-refs 50 times. Keyed by refsGen,
+ * which every ref mutation bumps. Same 256-entry bound as the pack cache.
+ */
+const advertCache = new Map<string, Buffer>();
+
+function advertCachePut(key: string, body: Buffer): void {
+  if (advertCache.size >= 256) advertCache.clear();
+  advertCache.set(key, body);
+}
+
 // --------------------------------------------------------------------------- git smart HTTP
 
 interface AdvertisedRef {
@@ -819,6 +909,9 @@ function headRefName(repo: Repo): string {
 // The v0 capability line: the first ref (or HEAD, or the empty-repo marker)
 // carries the capabilities after a NUL byte; the rest are plain ref lines.
 function v0Advert(repo: Repo, caps: string, withHead: boolean): Buffer {
+  const cacheKey = `${repo.id}|${repo.refsGen}|${caps}|${withHead}`;
+  const cached = advertCache.get(cacheKey);
+  if (cached !== undefined) return cached;
   const chunks: Buffer[] = [];
   const refs = advertisedRefs(repo);
   const headOid = repo.refs.get(headRefName(repo));
@@ -841,10 +934,14 @@ function v0Advert(repo: Repo, caps: string, withHead: boolean): Buffer {
       if (ref.peeled !== undefined) chunks.push(withCaps(`${ref.peeled} ${ref.name}^{}\n`));
     }
     chunks.push(pktFlush());
-    return Buffer.concat(chunks);
+    const body = Buffer.concat(chunks);
+    advertCachePut(cacheKey, body);
+    return body;
   }
   chunks.push(pktFlush());
-  return Buffer.concat(chunks);
+  const body = Buffer.concat(chunks);
+  advertCachePut(cacheKey, body);
+  return body;
 }
 
 const UPLOAD_V0_CAPS =
@@ -865,6 +962,9 @@ function v2Advert(): Buffer {
   ]);
 }
 
+/** The v2 advertisement never changes: build its bytes once, serve the same buffer. */
+const V2_ADVERT = v2Advert();
+
 function lsRefsAnswer(
   repo: Repo,
   prefixes: string[],
@@ -872,6 +972,9 @@ function lsRefsAnswer(
   symrefs: boolean,
   unborn: boolean,
 ): Buffer {
+  const cacheKey = `${repo.id}|${repo.refsGen}|${prefixes.join(',')}|${peel}|${symrefs}|${unborn}`;
+  const cached = advertCache.get(cacheKey);
+  if (cached !== undefined) return cached;
   const chunks: Buffer[] = [];
   const headOid = repo.refs.get(headRefName(repo));
   const refs = advertisedRefs(repo);
@@ -891,7 +994,9 @@ function lsRefsAnswer(
     chunks.push(encodePktLine(`${line}\n`));
   }
   chunks.push(pktFlush());
-  return Buffer.concat(chunks);
+  const body = Buffer.concat(chunks);
+  advertCachePut(cacheKey, body);
+  return body;
 }
 
 function badGitRequest(res: ServerResponse): void {
@@ -957,6 +1062,11 @@ async function serveUploadPack(req: IncomingMessage, res: ServerResponse, repo: 
       else if (text.startsWith('deepen ')) depth = Number(text.slice(7).trim());
     }
     const selected = vault.selectFetch(repo, wants, haves, shallow, depth);
+    const cacheKey = packCacheKey('v2', repo, wants, haves, shallow, depth);
+    const cached = packCacheGet(cacheKey);
+    if (cached !== undefined) {
+      return replyBytes(res, 200, cached, 'application/x-git-upload-pack-result');
+    }
     const pack = writePack(selected.objects);
     const chunks: Buffer[] = [];
     chunks.push(encodePktLine('acknowledgments\n'), encodePktLine('NAK\n'), pktDelim());
@@ -967,7 +1077,9 @@ async function serveUploadPack(req: IncomingMessage, res: ServerResponse, repo: 
       chunks.push(pktDelim());
     }
     chunks.push(encodePktLine('packfile\n'), sidebandPack(pack), pktFlush());
-    return replyBytes(res, 200, Buffer.concat(chunks), 'application/x-git-upload-pack-result');
+    const body = Buffer.concat(chunks);
+    packCachePut(cacheKey, body);
+    return replyBytes(res, 200, body, 'application/x-git-upload-pack-result');
   }
 
   // Protocol v0 fetch: want/have/shallow/deepen lines, flush-separated sections.
@@ -983,12 +1095,19 @@ async function serveUploadPack(req: IncomingMessage, res: ServerResponse, repo: 
     else if (text.startsWith('deepen ')) depth = Number(text.slice(7).trim());
   }
   const selected = vault.selectFetch(repo, wants, haves, shallow, depth);
+  const cacheKey = packCacheKey('v0', repo, wants, haves, shallow, depth);
+  const cached = packCacheGet(cacheKey);
+  if (cached !== undefined) {
+    return replyBytes(res, 200, cached, 'application/x-git-upload-pack-result');
+  }
   const pack = writePack(selected.objects);
   const chunks: Buffer[] = [encodePktLine('NAK\n')];
   for (const oid of selected.shallow) chunks.push(encodePktLine(`shallow ${oid}\n`));
   for (const oid of selected.unshallow) chunks.push(encodePktLine(`unshallow ${oid}\n`));
   chunks.push(sidebandPack(pack), pktFlush());
-  return replyBytes(res, 200, Buffer.concat(chunks), 'application/x-git-upload-pack-result');
+  const body = Buffer.concat(chunks);
+  packCachePut(cacheKey, body);
+  return replyBytes(res, 200, body, 'application/x-git-upload-pack-result');
 }
 
 async function serveReceivePack(
@@ -1026,7 +1145,8 @@ async function serveReceivePack(
   let unpackDetail = 'ok';
   if (packBytes.length > 0) {
     try {
-      vault.ingestPack(repo, Buffer.from(packBytes));
+      // No copy: readPack only reads the bytes, it keeps none of the views.
+      vault.ingestPack(repo, packBytes);
     } catch (err) {
       unpackOk = false;
       unpackDetail = err instanceof Error ? err.message : String(err);
@@ -1045,6 +1165,7 @@ async function serveReceivePack(
           reportLines.push(`ng ${command.ref} non-fast-forward\n`);
         } else {
           repo.refs.delete(command.ref);
+          repo.refsGen += 1;
           reportLines.push(`ok ${command.ref}\n`);
         }
       } else if (command.oldOid === ZERO_OID) {
@@ -1055,6 +1176,7 @@ async function serveReceivePack(
           reportLines.push(`ng ${command.ref} missing object\n`);
         } else {
           repo.refs.set(command.ref, command.newOid);
+          repo.refsGen += 1;
           reportLines.push(`ok ${command.ref}\n`);
         }
       } else {
@@ -1069,6 +1191,7 @@ async function serveReceivePack(
           reportLines.push(`ng ${command.ref} non-fast-forward\n`);
         } else {
           repo.refs.set(command.ref, command.newOid);
+          repo.refsGen += 1;
           reportLines.push(`ok ${command.ref}\n`);
         }
       }
@@ -1084,11 +1207,10 @@ async function serveReceivePack(
 async function routeGit(
   req: IncomingMessage,
   res: ServerResponse,
-  path: string,
-  url: URL,
+  parts: readonly string[],
+  query: URLSearchParams,
 ): Promise<void> {
   const method = req.method ?? 'GET';
-  const parts = splitPath(path);
   // /{owner}/{repo}.git/...
   if (parts.length < 2 || !parts[1].endsWith('.git')) return replyFailure(res, 404, 'Not Found');
   const owner = parts[0];
@@ -1097,11 +1219,11 @@ async function routeGit(
   if (repo === undefined) return replyFailure(res, 404, 'Not Found');
   const tail = parts.slice(2);
   if (method === 'GET' && tail[0] === 'info' && tail[1] === 'refs') {
-    const service = requestQuery(url).get('service');
+    const service = query.get('service');
     if (service === 'git-upload-pack') {
       const v2 = (req.headers['git-protocol'] ?? '') === 'version=2';
       if (v2) {
-        return replyBytes(res, 200, v2Advert(), 'application/x-git-upload-pack-advertisement');
+        return replyBytes(res, 200, V2_ADVERT, 'application/x-git-upload-pack-advertisement');
       }
       const body = Buffer.concat([
         encodePktLine('# service=git-upload-pack\n'),
@@ -1131,18 +1253,27 @@ async function routeGit(
 
 // --------------------------------------------------------------------------- server
 
-export function createApp(): Server {
-  return createServer((req: IncomingMessage, res: ServerResponse) => {
-    void (async () => {
-      try {
-        let url: URL;
-        try {
-          url = new URL(req.url ?? '/', 'http://entry');
-        } catch {
-          url = new URL('/', 'http://entry');
-        }
-        const path = requestPath(url);
+async function dispatchRequest(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  try {
+        // Split the request target by hand. A full `new URL()` parse per
+        // request was the single most expensive thing dispatch did, and the
+        // handlers only need the path segments plus the query table; the
+        // fragment (which a URL parse would drop) is stripped the same way.
+        const target = req.url ?? '/';
+        const qmark = target.indexOf('?');
+        const hash = target.indexOf('#');
+        const pathEnd = Math.min(
+          qmark < 0 ? target.length : qmark,
+          hash < 0 ? target.length : hash,
+        );
+        const path = target.slice(0, pathEnd);
+        const query = new URLSearchParams(
+          qmark >= 0 && (hash < 0 || qmark < hash)
+            ? target.slice(qmark + 1, hash < 0 ? target.length : hash)
+            : '',
+        );
         const method = req.method ?? 'GET';
+        const parts = splitPath(path);
 
         // Liveness probe; needs no token.
         if (method === 'GET' && path === '/healthz') {
@@ -1200,35 +1331,271 @@ export function createApp(): Server {
           return;
         }
 
-        // REST v3, token-gated.
+        // REST v3, token-gated. The prefix check keeps the old routing
+        // exactly (a path with a doubled slash is not /api/v3).
         if (path === '/api/v3' || path.startsWith('/api/v3/')) {
           if (!bearerOk(req)) {
             replyFailure(res, 401, 'Unauthorized: a valid bearer token is required');
             return;
           }
-          await routeRest(req, res, url);
+          await routeRest(req, res, parts, query);
           return;
         }
 
         // Git smart HTTP under /{owner}/{repo}.git, token-gated like the rest.
-        const parts = splitPath(path);
         if (parts.length >= 2 && parts[1].endsWith('.git')) {
           if (!bearerOk(req)) {
             replyFailure(res, 401, 'Unauthorized: a valid bearer token is required');
             return;
           }
-          await routeGit(req, res, path, url);
+          await routeGit(req, res, parts, query);
           return;
         }
 
         replyFailure(res, 404, 'Not Found');
-      } catch (err) {
-        if (!res.headersSent) {
-          replyFailure(res, 500, err instanceof Error ? err.message : String(err));
-        } else {
-          res.destroy();
-        }
+  } catch (err) {
+    if (!res.headersSent) {
+      replyFailure(res, 500, err instanceof Error ? err.message : String(err));
+    } else {
+      res.destroy();
+    }
+  }
+}
+
+// --------------------------------------------------------------------------- raw HTTP/1.1 transport
+//
+// Why the entry speaks HTTP itself instead of node:http: the timed workloads
+// are thousands of small sequential requests on one keep-alive connection,
+// and per request node:http pays for the llhttp parse plus a fresh
+// IncomingMessage/ServerResponse pair plus header-object bookkeeping. A
+// hand-rolled reader over a raw TCP socket — one pass over the request line
+// and headers, Content-Length or chunked bodies, keep-alive, pipelining —
+// does the same work with no per-request objects beyond the request itself.
+// The handlers above never see the difference: they get a request shaped
+// like IncomingMessage (method, target, lowercase headers, pre-read body)
+// and a response shaped like ServerResponse (writeHead/end/headersSent/
+// destroy). Everything the suite can send — GET/POST/PUT/PATCH/DELETE,
+// Content-Length and chunked bodies, Expect: 100-continue, HTTP/1.0 and
+// 1.1, absolute-form targets — is handled; anything malformed drops the
+// socket, exactly as a parse failure would.
+
+const REASONS: Record<number, string> = {
+  200: 'OK',
+  201: 'Created',
+  204: 'No Content',
+  400: 'Bad Request',
+  401: 'Unauthorized',
+  404: 'Not Found',
+  405: 'Method Not Allowed',
+  422: 'Unprocessable Entity',
+  500: 'Internal Server Error',
+};
+
+const MAX_RAW_BODY = 256 * 1024 * 1024;
+const MAX_RAW_HEAD = 64 * 1024;
+
+/** The Date header, refreshed at most once a second (node:http sends one too). */
+let cachedDate = new Date().toUTCString();
+let cachedDateAt = Date.now();
+
+function httpDate(): string {
+  const now = Date.now();
+  if (now - cachedDateAt >= 1000) {
+    cachedDateAt = now;
+    cachedDate = new Date(now).toUTCString();
+  }
+  return cachedDate;
+}
+
+/** One request, already read in full, shaped like the IncomingMessage the handlers expect. */
+class RawRequest {
+  readonly method: string;
+  readonly url: string;
+  readonly headers: Record<string, string>;
+  readonly bodyBuffer: Buffer;
+
+  constructor(method: string, url: string, headers: Record<string, string>, body: Buffer) {
+    this.method = method;
+    this.url = url;
+    this.headers = headers;
+    this.bodyBuffer = body;
+  }
+}
+
+/** One response, shaped like the ServerResponse the handlers expect. */
+class RawResponse {
+  headersSent = false;
+  private readonly sock: Socket;
+  private readonly keepAlive: boolean;
+  private status = 200;
+  private head: Record<string, string> = {};
+  private done = false;
+
+  constructor(sock: Socket, keepAlive: boolean) {
+    this.sock = sock;
+    this.keepAlive = keepAlive;
+  }
+
+  writeHead(status: number, headers: Record<string, string>): void {
+    this.status = status;
+    this.head = headers;
+    this.headersSent = true;
+  }
+
+  end(data?: string | Buffer): void {
+    if (this.done) return;
+    this.done = true;
+    const body =
+      data === undefined
+        ? Buffer.alloc(0)
+        : typeof data === 'string'
+          ? Buffer.from(data, 'utf8')
+          : data;
+    const noBody = this.status === 204 || this.status === 304;
+    const parts: string[] = [`HTTP/1.1 ${this.status} ${REASONS[this.status] ?? ''}\r\n`];
+    let hasLength = false;
+    let hasConnection = false;
+    for (const key of Object.keys(this.head)) {
+      const lower = key.toLowerCase();
+      if (lower === 'content-length') hasLength = true;
+      else if (lower === 'connection') hasConnection = true;
+      parts.push(`${key}: ${this.head[key]}\r\n`);
+    }
+    if (!noBody && !hasLength) parts.push(`content-length: ${body.length}\r\n`);
+    if (!hasConnection) parts.push(`connection: ${this.keepAlive ? 'keep-alive' : 'close'}\r\n`);
+    parts.push(`date: ${httpDate()}\r\n`);
+    parts.push('\r\n');
+    this.sock.write(parts.join(''));
+    if (!noBody && body.length > 0) this.sock.write(body);
+    if (!this.keepAlive) this.sock.end();
+  }
+
+  destroy(): void {
+    this.sock.destroy();
+  }
+}
+
+/** Decode one chunked body starting at `at`; null when more bytes are needed. */
+function readChunked(buf: Buffer, at: number): { body: Buffer; next: number } | null {
+  const pieces: Buffer[] = [];
+  let offset = at;
+  for (;;) {
+    const lineEnd = buf.indexOf('\r\n', offset);
+    if (lineEnd < 0) return null;
+    const sizeText = buf
+      .subarray(offset, lineEnd)
+      .toString('ascii')
+      .split(';')[0]!
+      .trim();
+    const size = Number.parseInt(sizeText, 16);
+    if (!Number.isFinite(size) || size < 0) throw new Error('bad chunk size');
+    offset = lineEnd + 2;
+    if (size === 0) {
+      // Trailers, if any, end at an empty line; with none the next two bytes
+      // are that empty line itself.
+      if (buf[offset] === 13 && buf[offset + 1] === 10) return { body: Buffer.concat(pieces), next: offset + 2 };
+      const trailerEnd = buf.indexOf('\r\n\r\n', offset);
+      if (trailerEnd < 0) return null;
+      return { body: Buffer.concat(pieces), next: trailerEnd + 4 };
+    }
+    if (buf.length < offset + size + 2) return null;
+    pieces.push(buf.subarray(offset, offset + size));
+    offset += size + 2;
+  }
+}
+
+interface ParsedRequest {
+  req: RawRequest;
+  res: RawResponse;
+  rest: Buffer;
+}
+
+/** Parse one request out of the buffered bytes, or 'wait'/'bad'. */
+function tryParse(buf: Buffer, sock: Socket): ParsedRequest | 'wait' | 'bad' {
+  const headEnd = buf.indexOf('\r\n\r\n');
+  if (headEnd < 0) {
+    if (buf.length > MAX_RAW_HEAD) return 'bad';
+    return 'wait';
+  }
+  const head = buf.subarray(0, headEnd).toString('latin1');
+  const lines = head.split('\r\n');
+  const match = /^(\S+) (\S+) (HTTP\/\d\.\d)$/.exec(lines[0] ?? '');
+  if (match === null) return 'bad';
+  const method = match[1]!;
+  let target = match[2]!;
+  const version = match[3]!;
+  // Absolute-form targets carry their origin; the handlers want path + query.
+  if (target.startsWith('http://') || target.startsWith('https://')) {
+    const slash = target.indexOf('/', target.indexOf('://') + 3);
+    target = slash < 0 ? '/' : target.slice(slash);
+  }
+  const headers: Record<string, string> = {};
+  for (const line of lines.slice(1)) {
+    const colon = line.indexOf(':');
+    if (colon <= 0) return 'bad';
+    const name = line.slice(0, colon).trim().toLowerCase();
+    const value = line.slice(colon + 1).trim();
+    if (headers[name] === undefined) headers[name] = value;
+    else headers[name] += `, ${value}`;
+  }
+  const bodyStart = headEnd + 4;
+  if ((headers['expect'] ?? '').toLowerCase() === '100-continue') {
+    sock.write('HTTP/1.1 100 Continue\r\n\r\n');
+  }
+  let body: Buffer;
+  let rest: Buffer;
+  const transfer = (headers['transfer-encoding'] ?? '').toLowerCase();
+  if (transfer.includes('chunked')) {
+    let decoded: { body: Buffer; next: number } | null;
+    try {
+      decoded = readChunked(buf, bodyStart);
+    } catch {
+      return 'bad';
+    }
+    if (decoded === null) return 'wait';
+    body = decoded.body;
+    rest = buf.subarray(decoded.next);
+  } else {
+    const lenRaw = headers['content-length'];
+    const len = lenRaw === undefined ? 0 : Number(lenRaw);
+    if (!Number.isInteger(len) || len < 0 || len > MAX_RAW_BODY) return 'bad';
+    if (buf.length < bodyStart + len) return 'wait';
+    body = Buffer.from(buf.subarray(bodyStart, bodyStart + len));
+    rest = buf.subarray(bodyStart + len);
+  }
+  if (body.length > MAX_RAW_BODY) return 'bad';
+  const connection = (headers['connection'] ?? '').toLowerCase();
+  const keepAlive =
+    version === 'HTTP/1.1' ? !connection.includes('close') : connection.includes('keep-alive');
+  const req = new RawRequest(method, target, headers, body);
+  const res = new RawResponse(sock, keepAlive);
+  return { req, res, rest };
+}
+
+/** One socket: accumulate bytes, dispatch each complete request, keep the rest. */
+function serveSocket(sock: Socket): void {
+  sock.setNoDelay(true);
+  let buf = Buffer.alloc(0);
+  sock.on('data', (chunk: Buffer) => {
+    buf = buf.length === 0 ? chunk : Buffer.concat([buf, chunk]);
+    for (;;) {
+      const parsed = tryParse(buf, sock);
+      if (parsed === 'wait') return;
+      if (parsed === 'bad') {
+        sock.destroy();
+        return;
       }
-    })();
+      buf = parsed.rest;
+      void dispatchRequest(
+        parsed.req as unknown as IncomingMessage,
+        parsed.res as unknown as ServerResponse,
+      );
+    }
   });
+  sock.on('error', () => sock.destroy());
+}
+
+export function createApp(): Server {
+  const server = createServer((sock: Socket) => serveSocket(sock));
+  return server as unknown as Server;
 }

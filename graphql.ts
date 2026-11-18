@@ -1081,6 +1081,7 @@ class Runner {
       }
       found.issue.state = 'closed';
       found.issue.closedAt = found.issue.updatedAt;
+      found.issue.jsonRev += 1;
       return { __t: 'CloseIssuePayload', issue: run.issueWrap(found.repo, found.issue) };
     },
 
@@ -1148,6 +1149,7 @@ class Runner {
         createdAt: found.issue.createdAt,
       };
       found.issue.comments.push(comment);
+      found.issue.jsonRev += 1;
       return {
         __t: 'AddCommentPayload',
         commentEdge: {

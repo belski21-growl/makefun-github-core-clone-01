@@ -4,6 +4,7 @@
 // (initialize + notifications/initialized) for older clients. Plain JSON answers, no SSE.
 
 import {
+  type Issue,
   type Repo,
   type Store,
   VIEWER_LOGIN,
@@ -123,7 +124,7 @@ export function repoJson(store: Store, repo: Repo): Record<string, unknown> {
   };
 }
 
-export function issueJson(store: Store, repo: Repo, issue: { id: number; number: number; title: string; body: string; state: string; labels: Array<{ name: string; color: string }>; comments: unknown[] }): Record<string, unknown> {
+export function issueJson(store: Store, repo: Repo, issue: Issue): Record<string, unknown> {
   return {
     id: issue.id,
     node_id: Buffer.from(`Issue:${repo.id}:${issue.number}`, 'utf8').toString('base64url'),
@@ -138,6 +139,25 @@ export function issueJson(store: Store, repo: Repo, issue: { id: number; number:
     updated_at: repo.createdAt,
     closed_at: null,
   };
+}
+
+/**
+ * The issue view as one serialised JSON string, cached on the issue object.
+ * A read is the hottest path in the suite (2,000 sequential GETs of one issue),
+ * and rebuilding the view object plus base64url node id plus JSON.stringify on
+ * every one of them is pure repeat work: nothing issueJson renders changes
+ * unless jsonRev moves, and every mutation site bumps jsonRev. The cache is a
+ * WeakMap keyed by the live issue object, so a deleted repository drops its
+ * entries with it and no stale bytes can survive a mutation.
+ */
+const issueTextCache = new WeakMap<Issue, { rev: number; text: string }>();
+
+export function issueJsonText(store: Store, repo: Repo, issue: Issue): string {
+  const hit = issueTextCache.get(issue);
+  if (hit !== undefined && hit.rev === issue.jsonRev) return hit.text;
+  const text = JSON.stringify(issueJson(store, repo, issue));
+  issueTextCache.set(issue, { rev: issue.jsonRev, text });
+  return text;
 }
 
 /** Run one tool. Returns {ok, value} or {ok:false, message} for a tool execution error. */

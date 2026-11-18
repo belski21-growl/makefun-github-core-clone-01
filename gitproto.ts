@@ -505,23 +505,44 @@ export function writePack(objects: Iterable<GitObject>): Buffer {
   header.write('PACK', 0, 4, 'ascii');
   header.writeUInt32BE(2, 4);
   header.writeUInt32BE(list.length, 8);
+  // The trailer is the SHA-1 of everything before it: hash incrementally and
+  // concat once, instead of building the body and then copying it a second
+  // time to append the digest.
+  const hash = createHash('sha1');
+  hash.update(header);
   parts.push(header);
   for (const object of list) {
-    parts.push(writePackObjectHeader(object.type, object.data.length));
-    parts.push(deflateSync(object.data));
+    const objHeader = writePackObjectHeader(object.type, object.data.length);
+    const deflated = deflateSync(object.data);
+    hash.update(objHeader);
+    hash.update(deflated);
+    parts.push(objHeader, deflated);
   }
-  const body = Buffer.concat(parts);
-  return Buffer.concat([body, createHash('sha1').update(body).digest()]);
+  parts.push(hash.digest());
+  return Buffer.concat(parts);
 }
 
 /** Split a pack into sideband band-1 pkt-lines (65515 data bytes each at most). */
 export function sidebandPack(pack: Buffer): Buffer {
-  const chunks: Buffer[] = [];
   const maxData = 65515;
-  for (let offset = 0; offset < pack.length; offset += maxData) {
-    const slice = pack.subarray(offset, Math.min(pack.length, offset + maxData));
-    chunks.push(encodePktLine(Buffer.concat([Buffer.from([1]), slice])));
+  const chunkCount = Math.max(1, Math.ceil(pack.length / maxData));
+  // One allocation for the whole framed pack: 4-byte hex length + band byte +
+  // payload per chunk. The old shape built each chunk with two concats and a
+  // third for the join — three full copies of the pack.
+  let total = 0;
+  for (let i = 0; i < chunkCount; i++) {
+    total += 4 + 1 + Math.min(maxData, pack.length - i * maxData);
   }
-  if (chunks.length === 0) chunks.push(encodePktLine(Buffer.concat([Buffer.from([1]), pack])));
-  return Buffer.concat(chunks);
+  const out = Buffer.allocUnsafe(total);
+  let at = 0;
+  for (let i = 0; i < chunkCount; i++) {
+    const start = i * maxData;
+    const n = Math.min(maxData, pack.length - start);
+    const len = 4 + 1 + n;
+    out.write(len.toString(16).padStart(4, '0'), at, 4, 'ascii');
+    out[at + 4] = 1;
+    pack.copy(out, at + 5, start, start + n);
+    at += len;
+  }
+  return out;
 }

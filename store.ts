@@ -58,6 +58,8 @@ export interface Issue {
   createdAt: string;
   updatedAt: string;
   closedAt: string | null;
+  /** Bumped on every mutation of a field issueJson renders, so a cached serialisation can tell it is stale. */
+  jsonRev: number;
 }
 
 export interface Pull {
@@ -95,6 +97,10 @@ export interface Repo {
   nextNumber: number;
   nextCommentId: number;
   nextObjectSeq: number;
+  /** Bumped whenever a git object is added, so a cached fetch pack can tell it is stale. */
+  packGen: number;
+  /** Bumped whenever a ref is created, moved or deleted, so a cached advertisement can tell it is stale. */
+  refsGen: number;
 }
 
 export class Store {
@@ -140,6 +146,8 @@ export class Store {
       nextNumber: 1,
       nextCommentId: 1,
       nextObjectSeq: 1,
+      packGen: 0,
+      refsGen: 0,
     };
     this.repos.set(this.repoKey(VIEWER_LOGIN, name), repo);
     return repo;
@@ -158,7 +166,10 @@ export class Store {
 
   putObject(repo: Repo, type: gp.GitObjectType, data: Buffer): string {
     const oid = gp.hashObject(type, data);
-    if (repo.objects.get(oid) === undefined) repo.objects.set(oid, { type, data });
+    if (repo.objects.get(oid) === undefined) {
+      repo.objects.set(oid, { type, data });
+      repo.packGen += 1;
+    }
     return oid;
   }
 
@@ -171,7 +182,10 @@ export class Store {
     const read = gp.readPack(pack, (oid) => repo.objects.get(oid));
     const oids: string[] = [];
     read.objects.forEach((object, oid) => {
-      if (!repo.objects.has(oid)) repo.objects.set(oid, object);
+      if (!repo.objects.has(oid)) {
+        repo.objects.set(oid, object);
+        repo.packGen += 1;
+      }
       oids.push(oid);
     });
     return oids;
@@ -341,6 +355,7 @@ export class Store {
     });
     const commitSha = this.putObject(repo, 'commit', commitData);
     repo.refs.set(`refs/heads/${branch}`, commitSha);
+    repo.refsGen += 1;
     return { commitSha, blobSha };
   }
 
@@ -369,6 +384,7 @@ export class Store {
       createdAt: FIXED_ISO,
       updatedAt: FIXED_ISO,
       closedAt: null,
+      jsonRev: 0,
     };
     repo.issues.set(number, issue);
     return issue;
@@ -524,6 +540,7 @@ export class Store {
     });
     const mergeSha = this.putObject(repo, 'commit', commitData);
     repo.refs.set(`refs/heads/${pull.baseRef}`, mergeSha);
+    repo.refsGen += 1;
     pull.state = 'closed';
     pull.merged = true;
     pull.mergedAt = FIXED_ISO;
