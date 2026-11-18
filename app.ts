@@ -45,7 +45,7 @@ import {
   type Repo,
 } from './store.ts';
 import { executeGraphQL, executeGraphQLBatch } from './graphql.ts';
-import { handleMcp, issueJson, issueJsonText, repoJson } from './mcp.ts';
+import { handleMcp, issueJson, issueJsonBuf, issueJsonText, repoJson } from './mcp.ts';
 
 // The bearer the suite presents lives in the process environment. An empty
 // environment token means "accept any non-empty bearer", which is how the local
@@ -135,6 +135,28 @@ function replyJsonText(
   res.end(body);
 }
 
+/**
+ * Answer with a JSON body that is already serialised AND already a Buffer
+ * (a cached issue view, newline included). Byte-identical to replyJsonText
+ * of the same value, without the per-reply string concat, byteLength scan
+ * and Buffer.from.
+ */
+function replyJsonBuf(
+  res: ServerResponse,
+  status: number,
+  body: Buffer,
+  extra: Record<string, string> = {},
+): void {
+  const headers: Record<string, string> = {
+    'content-type': JSON_MEDIA,
+    ...extra,
+  };
+  stampHeaders(headers);
+  if (status !== 204) headers['content-length'] = String(body.length);
+  res.writeHead(status, headers);
+  res.end(status === 204 ? Buffer.alloc(0) : body);
+}
+
 /** Answer with raw bytes (git protocol payloads): no JSON envelope, same id/quota headers. */
 function replyBytes(res: ServerResponse, status: number, payload: Buffer, media: string): void {
   const headers: Record<string, string> = {
@@ -148,7 +170,17 @@ function replyBytes(res: ServerResponse, status: number, payload: Buffer, media:
 
 /** Split a path into decoded, non-empty segments. A bad escape keeps its raw text. */
 function splitPath(path: string): string[] {
-  const raw = path.split('/').filter((piece) => piece !== '');
+  // Hand-rolled walk: one pass, one output array, no split() + filter()
+  // intermediate arrays per request. Empty segments (doubled or trailing
+  // slashes) are skipped exactly as the old filter did.
+  const raw: string[] = [];
+  let at = 0;
+  for (let i = 0; i <= path.length; i += 1) {
+    if (i === path.length || path[i] === '/') {
+      if (i > at) raw.push(path.slice(at, i));
+      at = i + 1;
+    }
+  }
   // Nearly every request path carries no escapes at all: skip the per-segment
   // decodeURIComponent (a try/catch each) when there is nothing to decode.
   if (!path.includes('%')) return raw;
@@ -639,7 +671,7 @@ async function routeRest(
             typeof body.body === 'string' ? body.body : '',
             labels,
           );
-          return replyJsonText(res, 201, issueJsonText(vault, repo, issue));
+          return replyJsonBuf(res, 201, issueJsonBuf(vault, repo, issue));
         }
         return replyFailure(res, 404, 'Not Found');
       }
@@ -648,7 +680,7 @@ async function routeRest(
       const issue = repo.issues.get(number);
       if (tail.length === 2) {
         if (issue === undefined) return replyFailure(res, 404, 'Not Found');
-        if (method === 'GET') return replyJsonText(res, 200, issueJsonText(vault, repo, issue));
+        if (method === 'GET') return replyJsonBuf(res, 200, issueJsonBuf(vault, repo, issue));
         if (method === 'PATCH') {
           const raw = await collectBody(req);
           const parsed = decodeJson(raw);
@@ -662,7 +694,7 @@ async function routeRest(
           }
           issue.updatedAt = FIXED_ISO;
           issue.jsonRev += 1;
-          return replyJsonText(res, 200, issueJsonText(vault, repo, issue));
+          return replyJsonBuf(res, 200, issueJsonBuf(vault, repo, issue));
         }
         return replyFailure(res, 404, 'Not Found');
       }
@@ -948,6 +980,26 @@ const UPLOAD_V0_CAPS =
   'side-band-64k thin-pack ofs-delta multi_ack_detailed shallow symref=HEAD:refs/heads/main agent=forge/1.0';
 const RECEIVE_CAPS = 'report-status side-band-64k delete-refs ofs-delta agent=forge/1.0';
 
+/**
+ * The whole info/refs answer for one service — service line + flush + the
+ * v0 advertisement — cached per (repo, refsGen, service). A push opens with
+ * one of these and a clone with one, so every timed push/clone pays it once;
+ * the v0Advert inside is already cached, but the service line + flush +
+ * concat around it was rebuilt on every advert.
+ */
+function serviceAdvert(repo: Repo, service: string, caps: string): Buffer {
+  const cacheKey = `svc|${repo.id}|${repo.refsGen}|${service}`;
+  const cached = advertCache.get(cacheKey);
+  if (cached !== undefined) return cached;
+  const body = Buffer.concat([
+    encodePktLine(`# service=${service}\n`),
+    pktFlush(),
+    v0Advert(repo, caps, true),
+  ]);
+  advertCachePut(cacheKey, body);
+  return body;
+}
+
 /** The protocol-v2 advertisement: a service line, a flush, then `version 2`. */
 function v2Advert(): Buffer {
   return Buffer.concat([
@@ -1225,20 +1277,20 @@ async function routeGit(
       if (v2) {
         return replyBytes(res, 200, V2_ADVERT, 'application/x-git-upload-pack-advertisement');
       }
-      const body = Buffer.concat([
-        encodePktLine('# service=git-upload-pack\n'),
-        pktFlush(),
-        v0Advert(repo, UPLOAD_V0_CAPS, true),
-      ]);
-      return replyBytes(res, 200, body, 'application/x-git-upload-pack-advertisement');
+      return replyBytes(
+        res,
+        200,
+        serviceAdvert(repo, 'git-upload-pack', UPLOAD_V0_CAPS),
+        'application/x-git-upload-pack-advertisement',
+      );
     }
     if (service === 'git-receive-pack') {
-      const body = Buffer.concat([
-        encodePktLine('# service=git-receive-pack\n'),
-        pktFlush(),
-        v0Advert(repo, RECEIVE_CAPS, true),
-      ]);
-      return replyBytes(res, 200, body, 'application/x-git-receive-pack-advertisement');
+      return replyBytes(
+        res,
+        200,
+        serviceAdvert(repo, 'git-receive-pack', RECEIVE_CAPS),
+        'application/x-git-receive-pack-advertisement',
+      );
     }
     return replyFailure(res, 404, 'Not Found');
   }
@@ -1252,6 +1304,9 @@ async function routeGit(
 }
 
 // --------------------------------------------------------------------------- server
+
+/** The one empty query table, shared by every request without a '?'. */
+const EMPTY_QUERY = new URLSearchParams();
 
 async function dispatchRequest(req: IncomingMessage, res: ServerResponse): Promise<void> {
   try {
@@ -1267,11 +1322,14 @@ async function dispatchRequest(req: IncomingMessage, res: ServerResponse): Promi
           hash < 0 ? target.length : hash,
         );
         const path = target.slice(0, pathEnd);
-        const query = new URLSearchParams(
-          qmark >= 0 && (hash < 0 || qmark < hash)
-            ? target.slice(qmark + 1, hash < 0 ? target.length : hash)
-            : '',
-        );
+        // Most requests carry no query string at all: reuse one frozen-empty
+        // table instead of building a URLSearchParams per request. Nothing
+        // mutates it — every caller that edits a query copies it first
+        // (paginationLink), the rest only call .get().
+        const query =
+          qmark < 0 || (hash >= 0 && qmark > hash)
+            ? EMPTY_QUERY
+            : new URLSearchParams(target.slice(qmark + 1, hash < 0 ? target.length : hash));
         const method = req.method ?? 'GET';
         const parts = splitPath(path);
 
@@ -1445,12 +1503,6 @@ class RawResponse {
   end(data?: string | Buffer): void {
     if (this.done) return;
     this.done = true;
-    const body =
-      data === undefined
-        ? Buffer.alloc(0)
-        : typeof data === 'string'
-          ? Buffer.from(data, 'utf8')
-          : data;
     const noBody = this.status === 204 || this.status === 304;
     const parts: string[] = [`HTTP/1.1 ${this.status} ${REASONS[this.status] ?? ''}\r\n`];
     let hasLength = false;
@@ -1461,12 +1513,28 @@ class RawResponse {
       else if (lower === 'connection') hasConnection = true;
       parts.push(`${key}: ${this.head[key]}\r\n`);
     }
-    if (!noBody && !hasLength) parts.push(`content-length: ${body.length}\r\n`);
+    const bodyLen =
+      data === undefined || noBody
+        ? 0
+        : typeof data === 'string'
+          ? Buffer.byteLength(data)
+          : data.length;
+    if (!noBody && !hasLength) parts.push(`content-length: ${bodyLen}\r\n`);
     if (!hasConnection) parts.push(`connection: ${this.keepAlive ? 'keep-alive' : 'close'}\r\n`);
     parts.push(`date: ${httpDate()}\r\n`);
     parts.push('\r\n');
-    this.sock.write(parts.join(''));
-    if (!noBody && body.length > 0) this.sock.write(body);
+    const head = parts.join('');
+    // One socket write per reply instead of two: head and body go out
+    // together, so a small response costs one syscall, not a head write plus
+    // a body write. String bodies concatenate in JS; Buffer bodies ride one
+    // concat, which is cheaper than the second write it replaces.
+    if (bodyLen === 0) {
+      this.sock.write(head);
+    } else if (typeof data === 'string') {
+      this.sock.write(head + data);
+    } else {
+      this.sock.write(Buffer.concat([Buffer.from(head, 'ascii'), data]));
+    }
     if (!this.keepAlive) this.sock.end();
   }
 
@@ -1517,26 +1585,55 @@ function tryParse(buf: Buffer, sock: Socket): ParsedRequest | 'wait' | 'bad' {
     if (buf.length > MAX_RAW_HEAD) return 'bad';
     return 'wait';
   }
+  // Hand-rolled scan, no split/regex: the request line and every header are
+  // walked with indexOf over the one latin1 head string, so a request costs
+  // no intermediate line array and no regex exec. Behaviour matches the old
+  // `^(\S+) (\S+) (HTTP\/\d\.\d)$` + per-line `name: value` parse exactly:
+  // three space-separated tokens, version HTTP/x.y, every header line with a
+  // colon past position 0, duplicate names folded with ', '.
   const head = buf.subarray(0, headEnd).toString('latin1');
-  const lines = head.split('\r\n');
-  const match = /^(\S+) (\S+) (HTTP\/\d\.\d)$/.exec(lines[0] ?? '');
-  if (match === null) return 'bad';
-  const method = match[1]!;
-  let target = match[2]!;
-  const version = match[3]!;
+  const lineEnd = head.indexOf('\r\n');
+  if (lineEnd < 0) return 'bad';
+  const requestLine = head.slice(0, lineEnd);
+  const sp1 = requestLine.indexOf(' ');
+  const sp2 = sp1 < 0 ? -1 : requestLine.indexOf(' ', sp1 + 1);
+  if (sp1 <= 0 || sp2 <= sp1 + 1) return 'bad';
+  const method = requestLine.slice(0, sp1);
+  let target = requestLine.slice(sp1 + 1, sp2);
+  // The old `(\S+) (\S+)` tokens rejected any whitespace inside them; the
+  // space scan above only splits on ' ', so tabs must be refused explicitly.
+  if (method.includes('\t') || target.includes('\t')) return 'bad';
+  const version = requestLine.slice(sp2 + 1);
+  if (
+    version.length !== 8 ||
+    !version.startsWith('HTTP/') ||
+    version[5]! < '0' ||
+    version[5]! > '9' ||
+    version[6] !== '.' ||
+    version[7]! < '0' ||
+    version[7]! > '9'
+  ) {
+    return 'bad';
+  }
   // Absolute-form targets carry their origin; the handlers want path + query.
   if (target.startsWith('http://') || target.startsWith('https://')) {
     const slash = target.indexOf('/', target.indexOf('://') + 3);
     target = slash < 0 ? '/' : target.slice(slash);
   }
   const headers: Record<string, string> = {};
-  for (const line of lines.slice(1)) {
+  let at = lineEnd + 2;
+  while (at < head.length) {
+    const end = head.indexOf('\r\n', at);
+    const line = end < 0 ? head.slice(at) : head.slice(at, end);
+    if (line.length === 0) break;
     const colon = line.indexOf(':');
     if (colon <= 0) return 'bad';
     const name = line.slice(0, colon).trim().toLowerCase();
     const value = line.slice(colon + 1).trim();
     if (headers[name] === undefined) headers[name] = value;
     else headers[name] += `, ${value}`;
+    if (end < 0) break;
+    at = end + 2;
   }
   const bodyStart = headEnd + 4;
   if ((headers['expect'] ?? '').toLowerCase() === '100-continue') {

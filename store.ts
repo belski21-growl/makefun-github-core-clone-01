@@ -364,7 +364,7 @@ export class Store {
     if (commitOid === undefined) return undefined;
     const object = repo.objects.get(commitOid);
     if (object === undefined || object.type !== 'commit') return undefined;
-    return gp.parseCommit(object.data).tree;
+    return gp.parseCommitHead(object.data).tree;
   }
 
   // ------------------------------------------------------------ issues & pulls
@@ -583,10 +583,10 @@ export class Store {
       if (object === undefined) continue;
       held.add(oid);
       if (object.type === 'commit') {
-        const commit = gp.parseCommit(object.data);
-        for (const treeOid of gp.collectReachable([commit.tree], lookup)) held.add(treeOid);
+        const head = gp.parseCommitHead(object.data);
+        for (const treeOid of gp.collectReachable([head.tree], lookup)) held.add(treeOid);
         if (shallowSet.has(oid)) continue;
-        for (const parent of commit.parents) heldQueue.push(parent);
+        for (const parent of head.parents) heldQueue.push(parent);
       } else if (object.type === 'tag') {
         heldQueue.push(gp.parseTag(object.data).object);
       } else if (object.type === 'tree') {
@@ -608,9 +608,9 @@ export class Store {
         if (wanted.has(oid) && seen !== undefined && seen <= at) continue;
         wanted.add(oid);
         commitDepth.set(oid, at);
-        const commit = gp.parseCommit(object.data);
-        for (const treeOid of gp.collectReachable([commit.tree], lookup)) wanted.add(treeOid);
-        for (const parent of commit.parents) wantQueue.push({ oid: parent, depth: at + 1 });
+        const head = gp.parseCommitHead(object.data);
+        for (const treeOid of gp.collectReachable([head.tree], lookup)) wanted.add(treeOid);
+        for (const parent of head.parents) wantQueue.push({ oid: parent, depth: at + 1 });
       } else if (object.type === 'tag') {
         if (wanted.has(oid)) continue;
         wanted.add(oid);
@@ -637,13 +637,13 @@ export class Store {
         if (at !== depth - 1) continue;
         const object = lookup(oid);
         if (object === undefined || object.type !== 'commit') continue;
-        const parents = gp.parseCommit(object.data).parents;
+        const parents = gp.parseCommitHead(object.data).parents;
         if (parents.some((parent) => !wanted.has(parent))) shallow.push(oid);
       }
       for (const boundary of shallowBoundaries) {
         const object = lookup(boundary);
         if (object === undefined || object.type !== 'commit') continue;
-        const parents = gp.parseCommit(object.data).parents;
+        const parents = gp.parseCommitHead(object.data).parents;
         if (parents.length > 0 && parents.every((parent) => wanted.has(parent))) {
           unshallow.push(boundary);
         } else if (wanted.has(boundary) && !shallow.includes(boundary)) {

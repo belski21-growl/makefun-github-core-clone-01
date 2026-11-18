@@ -160,6 +160,24 @@ export function issueJsonText(store: Store, repo: Repo, issue: Issue): string {
   return text;
 }
 
+/**
+ * The issue view as one Buffer, trailing newline baked in, cached on the
+ * issue object next to the text form. The read workload GETs one issue 2,000
+ * times: rebuilding `${text}\n` and Buffer.from-ing it on every reply is
+ * repeat work — the bytes only change when jsonRev moves, and the buffer
+ * cache is keyed by the same revision, so a mutation can never serve stale
+ * bytes.
+ */
+const issueBufCache = new WeakMap<Issue, { rev: number; buf: Buffer }>();
+
+export function issueJsonBuf(store: Store, repo: Repo, issue: Issue): Buffer {
+  const hit = issueBufCache.get(issue);
+  if (hit !== undefined && hit.rev === issue.jsonRev) return hit.buf;
+  const buf = Buffer.from(`${issueJsonText(store, repo, issue)}\n`, 'utf8');
+  issueBufCache.set(issue, { rev: issue.jsonRev, buf });
+  return buf;
+}
+
 /** Run one tool. Returns {ok, value} or {ok:false, message} for a tool execution error. */
 export function runTool(
   store: Store,
